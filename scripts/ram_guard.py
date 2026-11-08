@@ -6,6 +6,8 @@ One file, Python standard library only, Linux only. Subcommands:
   daemon     watch memory; pause, resume and (last resort) kill agent-started processes
   hook       Claude Code hook entry point (PreToolUse, UserPromptSubmit, SessionStart)
   status     show the memory level, paused processes and recent events
+  budget     how much work fits in the free memory right now (plan parallelism from this)
+  wait       block until memory has recovered; costs an agent no tokens while it waits
   top        list the heaviest agent-started process trees
   resume     resume everything ram-guard paused and hold off pausing for a while
   kill       kill one agent-started process tree (by pid, or "largest")
@@ -33,7 +35,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOME = os.path.expanduser("~")
 UID = os.getuid()
 MYPID = os.getpid()
@@ -50,25 +52,37 @@ CONFIG_PATH = _env("RAM_GUARD_CONFIG", os.path.join(
 RUNTIME_DIR = _env("RAM_GUARD_RUNTIME", os.path.join(
     _env("XDG_RUNTIME_DIR", "/tmp/ram-guard-%d" % UID), "ram-guard"))
 STATE_PATH = os.path.join(RUNTIME_DIR, "state.json")
+QUIET_PATH = os.path.join(RUNTIME_DIR, "quiet")
 # Overridable so the self-test can simulate memory pressure without causing any.
 MEMINFO = _env("RAM_GUARD_MEMINFO", "/proc/meminfo")
 PSI = _env("RAM_GUARD_PSI", "/proc/pressure/memory")
 
 DEFAULTS = {
     # Percent of RAM in use (MemTotal - MemAvailable).
-    "warn_pct": 80,          # tell the agent to lighten up
-    "pause_pct": 90,         # freeze agent-started processes, hold new launches
-    "resume_pct": 75,        # thaw them again below this
+    # The defaults let agents use nearly all of the machine and step in late:
+    # on 32 GB, work is frozen at about 30 GB used and thawed again at about 28 GB.
+    "warn_pct": 87,          # tell the agent to lighten up
+    "pause_pct": 93,         # freeze the fastest-growing agent-started job
+    "resume_pct": 88,        # thaw again below this
     # Last resort: kill the largest agent-started tree when RAM *and* swap are nearly gone.
     "kill_enabled": True,
     "kill_pct": 97,
     "kill_swap_pct": 90,
     # Memory pressure stall (PSI "full avg10", percent of time everything stalls). 0 disables.
+    # Only acted on once RAM itself is filling (above resume_pct / warn_pct).
     "psi_warn": 10,
     "psi_pause": 25,
+    # Planning: a "heavy job" (a build, a test run, a dev server) is assumed to need job_mb.
+    "job_mb": 2048,
+    # New launches are held once less than this is left before the pause line, so work
+    # is not started only to be frozen a moment later.
+    "launch_reserve_mb": 1024,
     "interval_sec": 2,       # polling interval while healthy (faster under pressure)
     "min_tree_mb": 100,      # never bother pausing process trees smaller than this
     "max_pause_sec": 300,    # stale-pause release: thaw after this long if RAM is below pause_pct
+    # No stop-start churn: a job that was just thawed runs at least this long before it
+    # can be frozen again, unless usage gets halfway from pause_pct to kill_pct.
+    "min_run_sec": 30,
     "snooze_sec": 120,       # `ram-guard resume` holds off pausing for this long
     "hook_wait_sec": 45,     # how long a tool call is held before it is denied
     "remind_sec": 300,       # min gap between "memory is tight" reminders per session
@@ -170,15 +184,35 @@ def read_mem():
     }
 
 
+def psi_pause_on(m, cfg):
+    """Pressure stalls count only once RAM is actually filling up.
+
+    The system-wide pressure figure also rises when one memory-capped cgroup
+    (a container, a `ram-guard run` job) thrashes against its own limit while the
+    machine has plenty free. Acting on that would slow agents for no reason.
+    """
+    return cfg["psi_pause"] > 0 and m["psi"] >= cfg["psi_pause"] and m["used_pct"] >= cfg["warn_pct"]
+
+
+def psi_warn_on(m, cfg):
+    return cfg["psi_warn"] > 0 and m["psi"] >= cfg["psi_warn"] and m["used_pct"] >= cfg["resume_pct"]
+
+
 def level_of(m, cfg):
-    psi = m["psi"]
     if cfg["kill_enabled"] and m["used_pct"] >= cfg["kill_pct"] and m["swap_pct"] >= cfg["kill_swap_pct"]:
         return "emergency"
-    if m["used_pct"] >= cfg["pause_pct"] or (cfg["psi_pause"] > 0 and psi >= cfg["psi_pause"]):
+    if m["used_pct"] >= cfg["pause_pct"] or psi_pause_on(m, cfg):
         return "critical"
-    if m["used_pct"] >= cfg["warn_pct"] or (cfg["psi_warn"] > 0 and psi >= cfg["psi_warn"]):
+    if m["used_pct"] >= cfg["warn_pct"] or psi_warn_on(m, cfg):
         return "warn"
     return "ok"
+
+
+def quiet_limit_kb(m, cfg):
+    """MemAvailable (kB) above which the hooks have nothing to say (see ram_guard_hook.sh)."""
+    if not cfg["hooks_enabled"]:
+        return 0
+    return int(m["total_kb"] * (100 - cfg["warn_pct"]) / 100.0 + 2 * cfg["job_mb"] * 1024)
 
 
 def gb(kb):
@@ -193,6 +227,52 @@ def describe(m):
     swap = "swap %.0f%% used" % m["swap_pct"] if m["swap_total_kb"] else "no swap"
     return "RAM %.1f%% used (%s available of %s), %s, pressure %.1f" % (
         m["used_pct"], gb(m["avail_kb"]), gb(m["total_kb"]), swap, m["psi"])
+
+
+def launch_pct(m, cfg):
+    """RAM-in-use percentage above which new launches are held."""
+    reserve = 100.0 * cfg["launch_reserve_mb"] * 1024 / m["total_kb"]
+    return max(cfg["warn_pct"], cfg["pause_pct"] - reserve)
+
+
+def size_arg(kb):
+    """A size as `ram-guard run --max` takes it: 16G, 1.5G, 512M."""
+    if kb >= 1048576:
+        return ("%.1f" % (kb / 1048576.0)).rstrip("0").rstrip(".") + "G"
+    return "%dM" % (kb // 1024)
+
+
+def budget(m, cfg, job_mb=None):
+    """How much new work fits without crossing the warn line."""
+    total, avail = m["total_kb"], m["avail_kb"]
+    job_kb = max(int((job_mb or cfg["job_mb"]) * 1024), 1024)
+    warn_room = max(int(avail - total * (100 - cfg["warn_pct"]) / 100.0), 0)
+    launch_room = max(int(avail - total * (100 - launch_pct(m, cfg)) / 100.0), 0)
+    cpus = os.cpu_count() or 1
+    by_mem = warn_room // job_kb
+    step = 512 * 1024 if warn_room >= 2 * 1048576 else 128 * 1024
+    cap_kb = int((warn_room or launch_room) * 0.8) // step * step
+    return {"warn_room_kb": warn_room, "launch_room_kb": launch_room, "job_kb": job_kb,
+            "slots": int(min(by_mem, cpus)), "mem_slots": int(by_mem),
+            "cpu_limited": by_mem > cpus, "cpus": cpus,
+            "cap_kb": cap_kb}
+
+
+def budget_line(m, cfg, b=None, hold=False, cap=True):
+    b = b or budget(m, cfg)
+    head = "RAM %.0f%% used, %s available." % (m["used_pct"], gb(m["avail_kb"]))
+    if hold:
+        return head + " Budget: none; new launches are held until memory recovers."
+    if b["slots"] >= 2:
+        text = " Budget: up to %d heavy jobs in parallel (about %s each%s)." % (
+            b["slots"], mb(b["job_kb"]), ", limited by CPU count" if b["cpu_limited"] else "")
+    elif b["slots"] == 1:
+        text = " Budget: one heavy job at a time (about %s)." % mb(b["job_kb"])
+    else:
+        text = " Budget: one light job at a time; %s left before launches are held." % mb(b["launch_room_kb"])
+    if cap and b["cap_kb"] >= 128 * 1024:
+        text += " Cap a big command: `ram-guard run --max %s -- <cmd>`." % size_arg(b["cap_kb"])
+    return head + text
 
 
 # ----------------------------------------------------------------- processes
@@ -441,6 +521,8 @@ class Daemon(object):
         self.stopping = False
         self.noted_nothing = False
         self.kids = []
+        self.resumed_at = {}        # root pid -> (starttime, when thawed)
+        self.quiet_written = None
         self.last_notify = {}
         self.last_err = ("", 0.0)
 
@@ -460,7 +542,7 @@ class Daemon(object):
         if not self.cfg["notify"] or not shutil.which("notify-send"):
             return
         now = time.time()
-        if now - self.last_notify.get(title, 0) < 20:
+        if now - self.last_notify.get(title, 0) < 60:
             return
         self.last_notify[title] = now
         try:
@@ -528,6 +610,7 @@ class Daemon(object):
         finally:
             self.resume_all("ram-guard stopping")
             try:
+                self.write_quiet(None, stopping=True)
                 self.write_state(read_mem(), time.time(), stopped=True)
             except Exception:
                 pass
@@ -589,7 +672,25 @@ class Daemon(object):
         elif self.paused:
             self.maybe_resume(m, raw, now)
         self.write_state(m, now)
+        self.write_quiet(m)
         return raw
+
+    def write_quiet(self, m, stopping=False):
+        """Publish the fast-path line for the hooks, or withdraw it when they are needed."""
+        want = None
+        if not stopping and self.level == "ok" and not self.paused:
+            want = quiet_limit_kb(m, self.cfg)
+        if want == self.quiet_written:
+            return
+        try:
+            if want is None:
+                if os.path.exists(QUIET_PATH):
+                    os.unlink(QUIET_PATH)
+            else:
+                atomic_write(QUIET_PATH, "%d\n" % want)
+            self.quiet_written = want
+        except OSError:
+            pass
 
     # -- actions
     def oom_protect(self, owned):
@@ -633,6 +734,16 @@ class Daemon(object):
                  if t["rss_kb"] >= min_kb and not (held & set(t["pids"]))
                  and any(self.procs[x].state not in "TtZ" for x in t["pids"])
                  and not cmd_protected(t["root"], cfg)]
+        if cands:
+            # Anti-flap: leave recently thawed jobs running unless memory is dangerously low.
+            hard = raw == "emergency" or m["used_pct"] >= (cfg["pause_pct"] + cfg["kill_pct"]) / 2.0
+            if not hard:
+                def rested(t):
+                    r = self.resumed_at.get(t["root"])
+                    return not r or r[0] != t["start"] or now - r[1] >= cfg["min_run_sec"]
+                cands = [t for t in cands if rested(t)]
+                if not cands:
+                    return
         if not cands:
             if not self.paused and not self.noted_nothing:
                 self.noted_nothing = True
@@ -644,7 +755,7 @@ class Daemon(object):
                             "critical")
             return
         mem_crit = m["used_pct"] >= cfg["pause_pct"]
-        psi_crit = cfg["psi_pause"] > 0 and m["psi"] >= cfg["psi_pause"]
+        psi_crit = psi_pause_on(m, cfg)
         go = (not self.paused or raw == "emergency"
               or (mem_crit and m["used_pct"] >= self.last_stop_used + PAUSE_STEP_PCT)
               or (psi_crit and now - self.last_stop_t >= PSI_SETTLE_SEC))
@@ -680,8 +791,7 @@ class Daemon(object):
         cfg = self.cfg
         if now - self.last_stop_t < RESUME_STEP_SEC or now - self.last_resume_t < RESUME_STEP_SEC:
             return
-        psi_ok = cfg["psi_pause"] <= 0 or m["psi"] < cfg["psi_pause"]
-        recovered = m["used_pct"] < cfg["resume_pct"] and psi_ok
+        recovered = m["used_pct"] < cfg["resume_pct"]
         oldest = min(e["since"] for e in self.paused)
         stale = (cfg["max_pause_sec"] > 0 and raw in ("ok", "warn")
                  and now - oldest >= cfg["max_pause_sec"]
@@ -698,6 +808,10 @@ class Daemon(object):
             send(pid, start, signal.SIGCONT)
         if e in self.paused:
             self.paused.remove(e)
+        if len(self.resumed_at) > 500:
+            self.resumed_at.clear()
+        root_start = next((st for pid, st in e["pids"] if pid == e["root"]), None)
+        self.resumed_at[e["root"]] = (root_start, time.time())
         self.log("RESUMED pid %d %s (%s)%s" % (e["root"], e["comm"], why,
                                                ": " + describe(m) if m else ""))
         if not self.paused:
@@ -750,8 +864,9 @@ class Daemon(object):
 
 # ----------------------------------------------------------------- hook
 
-LIGHT_CMDS = set("""ram-guard free ps kill pkill pgrep killall uptime vmstat ls cat head tail grep rg
+LIGHT_CMDS = set("""free ps kill pkill pgrep killall uptime vmstat ls cat head tail grep rg
 wc pwd echo date df du stat sort cut uniq true sleep""".split())
+RG_LIGHT_SUBCMDS = set("status top kill resume config budget wait --version --help -h".split())
 GIT_READONLY = set("status diff log show branch rev-parse remote".split())
 
 
@@ -768,7 +883,11 @@ def is_light_command(cmd):
             return False
         base = os.path.basename(tok[0])
         if base.startswith("python") and len(tok) > 1 and tok[1].endswith("ram_guard.py"):
-            continue
+            tok, base = tok[1:], "ram-guard"
+        if base == "ram-guard":
+            if len(tok) > 1 and tok[1] in RG_LIGHT_SUBCMDS:
+                continue
+            return False  # `ram-guard run ...` starts real work
         if base == "git" and len(tok) > 1 and tok[1] in GIT_READONLY:
             continue
         if base not in LIGHT_CMDS:
@@ -785,7 +904,7 @@ def emit(event, **spec):
 def paused_lines(paused):
     now = time.time()
     return ["  paused: pid %d %s, %d MB, for %ds: %s" % (
-        e["root"], e["comm"], e["rss_mb"], int(now - e["since"]), e.get("cmd", ""))
+        e["root"], e["comm"], e["rss_mb"], int(now - e["since"]), e.get("cmd", "")[:60])
         for e in paused]
 
 
@@ -800,21 +919,29 @@ def tree_lines(cfg, st, limit=5):
             for t in trees[:limit] if t["rss_kb"] >= 20 * 1024]
 
 
-def due_reminder(session, gap):
+def _stamp(session, kind):
+    return os.path.join(RUNTIME_DIR, "%s-%s" % (kind, re.sub(r"[^A-Za-z0-9_-]", "_", session)[:80]))
+
+
+def mark(session, kind):
     try:
         os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
-        path = os.path.join(RUNTIME_DIR, "remind-" + re.sub(r"[^A-Za-z0-9_-]", "_", session)[:80])
-        try:
-            if time.time() - os.stat(path).st_mtime < gap:
-                return False
-        except OSError:
+        with open(_stamp(session, kind), "w"):
             pass
-        with open(path, "w"):
-            pass
-        os.utime(path, None)
+        os.utime(_stamp(session, kind), None)
     except OSError:
         pass
-    return True
+
+
+def due(session, kind, gap, touch=True):
+    """True if `kind` has not happened for this session in the last `gap` seconds."""
+    try:
+        fresh = time.time() - os.stat(_stamp(session, kind)).st_mtime < gap
+    except OSError:
+        fresh = False
+    if touch and not fresh:
+        mark(session, kind)
+    return not fresh
 
 
 def hook_view(cfg):
@@ -824,18 +951,16 @@ def hook_view(cfg):
     paused = (st or {}).get("paused") or []
     snoozed = time.time() < (st or {}).get("snooze_until", 0)
     hold = lvl == "emergency" or (not snoozed and (
-        lvl == "critical" or (paused and m["used_pct"] >= cfg["resume_pct"])))
+        lvl == "critical" or m["used_pct"] >= launch_pct(m, cfg)
+        or (bool(paused) and m["used_pct"] >= cfg["resume_pct"])))
     return m, lvl, st, paused, hold
 
 
-WARN_ADVICE = (
-    "Lighten the load before starting more work: run agents and builds one at a time, "
-    "lower parallelism (for example -j2, fewer test workers), stop dev servers and watchers "
-    "you no longer need, and wrap heavy commands as `ram-guard run --max 4G -- <command>` "
-    "so they cannot take the whole machine. `ram-guard top` lists what your work is using.")
+FANOUT_TOOLS = ("Agent", "Task", "Workflow")
 
 
 def hook_main():
+    """Keep every message short: the agent pays for each word on every call."""
     try:
         data = json.load(sys.stdin)
     except Exception:
@@ -850,54 +975,65 @@ def hook_main():
     if event == "PreToolUse":
         tool = str(data.get("tool_name") or "tool")
         if not hold:
-            if (lvl == "warn" or paused) and due_reminder(session, cfg["remind_sec"]):
+            b = budget(m, cfg)
+            tight = lvl == "warn" or paused or (tool in FANOUT_TOOLS and b["mem_slots"] <= 1)
+            if tight and due(session, "remind", cfg["remind_sec"]):
                 emit(event, additionalContext="\n".join(
-                    ["ram-guard: memory is getting tight. " + describe(m) + ".",
-                     "At %g%% ram-guard pauses the heaviest processes you started. %s" % (
-                         cfg["pause_pct"], WARN_ADVICE)] + paused_lines(paused)))
+                    ["ram-guard: memory is tight. %s Run jobs and agents one after another; "
+                     "work is paused at %g%% RAM." % (budget_line(m, cfg, b), cfg["pause_pct"])]
+                    + paused_lines(paused)))
             return 0
         if tool == "Bash" and is_light_command(str((data.get("tool_input") or {}).get("command") or "")):
             return 0
-        t0 = time.time()
-        while time.time() - t0 < cfg["hook_wait_sec"]:
-            time.sleep(1)
-            m, lvl, st, paused, hold = hook_view(cfg)
-            if not hold:
-                emit(event, additionalContext=(
-                    "ram-guard: this call was held %ds because memory was critical; it recovered "
-                    "(%s) so the call is going ahead. %s" % (int(time.time() - t0), describe(m), WARN_ADVICE)))
-                return 0
-        lines = [
-            "ram-guard: memory is critical, so this %s call was held %ds and then blocked to keep "
-            "the system and Claude from crashing. Nothing is wrong with the call itself." % (
-                tool, int(time.time() - t0)),
-            describe(m) + ". Launches resume below %g%%." % cfg["resume_pct"],
-        ]
-        lines += paused_lines(paused)
-        trees = tree_lines(cfg, st)
-        if trees:
-            lines.append("Largest process trees started by agents:")
-            lines += trees
-        lines.append(
-            "What to do: 1) do not retry heavy work straight away; 2) free memory you own with "
-            "`ram-guard kill <pid>` for anything above you no longer need (inspection commands such "
-            "as `ram-guard status`, `ram-guard top`, ps, free and kill are always allowed); 3) if "
-            "nothing of yours is large, other applications hold the memory: tell the user and wait; "
-            "4) when you retry, use less memory (one job at a time, lower parallelism, or "
-            "`ram-guard run --max 4G -- <command>`). File reads and edits are not blocked.")
+        waited = 0
+        if due(session, "deny", 60, touch=False):
+            # First block in a while: hold the call, a short spike often clears by itself.
+            t0 = time.time()
+            while time.time() - t0 < cfg["hook_wait_sec"]:
+                time.sleep(1)
+                m, lvl, st, paused, hold = hook_view(cfg)
+                if not hold:
+                    emit(event, additionalContext="ram-guard: held this call %ds until memory "
+                         "recovered. %s" % (int(time.time() - t0), budget_line(m, cfg)))
+                    return 0
+            waited = int(time.time() - t0)
+        # Blocked again within a minute: answer at once, holding again only wastes time.
+        mark(session, "deny")
+        if due(session, "denyfull", cfg["remind_sec"]):
+            lines = [
+                "ram-guard: blocked this %s call%s so the system and Claude do not crash. %s" % (
+                    tool, " after holding it %ds" % waited if waited else "",
+                    budget_line(m, cfg, hold=True)),
+                "The call itself is fine. Do not retry in a loop: run `ram-guard wait` once (it "
+                "blocks until memory recovers and costs no tokens), then retry. To free memory "
+                "you own: `ram-guard top`, then `ram-guard kill <pid>`. Reads and edits still "
+                "work. If nothing of yours is large, tell the user other applications hold the memory.",
+            ]
+            lines += paused_lines(paused)
+            trees = tree_lines(cfg, st, 3)
+            if trees:
+                lines.append("Largest agent-started trees:")
+                lines += trees
+        else:
+            lines = ["ram-guard: still blocked (RAM %.0f%% used). Run `ram-guard wait` instead "
+                     "of retrying." % m["used_pct"]]
         emit(event, permissionDecision="deny", permissionDecisionReason="\n".join(lines))
         return 0
 
-    if event in ("UserPromptSubmit", "SessionStart") and (lvl != "ok" or paused):
-        head = {"warn": "memory is getting tight", "critical": "memory is critical",
-                "emergency": "memory is nearly exhausted"}.get(lvl, "some of your processes are paused")
-        lines = ["ram-guard: %s. %s." % (head, describe(m))] + paused_lines(paused)
+    if event == "SessionStart":
+        # One line per session so the agent can size its work before it starts any.
+        emit(event, additionalContext="\n".join(
+            ["ram-guard: %s Check `ram-guard budget` before starting parallel agents, builds "
+             "or test runs; work is paused at %g%% RAM." % (
+                 budget_line(m, cfg, hold=hold, cap=False), cfg["pause_pct"])] + paused_lines(paused)))
+        return 0
+
+    if event == "UserPromptSubmit" and (lvl != "ok" or paused or hold):
+        lines = ["ram-guard: %s %s" % ("launches are on hold." if hold else "memory is tight.",
+                                       budget_line(m, cfg, hold=hold))] + paused_lines(paused)
         if hold:
-            lines.append("New Bash, agent and workflow launches are on hold until usage falls below "
-                         "%g%%. Free memory first (`ram-guard top`, `ram-guard kill <pid>`) or tell the "
-                         "user what is using it." % cfg["resume_pct"])
-        else:
-            lines.append(WARN_ADVICE)
+            lines.append("Do not start heavy work. Free memory you own (`ram-guard top`, "
+                         "`ram-guard kill <pid>`) or run `ram-guard wait`.")
         emit(event, additionalContext="\n".join(lines))
     return 0
 
@@ -920,9 +1056,10 @@ def cmd_status(args):
         return 0
     print("level:    %s" % lvl.upper())
     print("memory:   %s" % describe(m))
-    print("limits:   warn %g%%, pause %g%%, resume %g%%, last-resort kill %s" % (
-        cfg["warn_pct"], cfg["pause_pct"], cfg["resume_pct"],
+    print("limits:   warn %g%%, hold launches %.1f%%, pause %g%%, resume %g%%, last-resort kill %s" % (
+        cfg["warn_pct"], launch_pct(m, cfg), cfg["pause_pct"], cfg["resume_pct"],
         "at %g%% RAM + %g%% swap" % (cfg["kill_pct"], cfg["kill_swap_pct"]) if cfg["kill_enabled"] else "off"))
+    print("budget:   %s" % budget_line(m, cfg, hold=hook_view(cfg)[4]).split(" Budget: ", 1)[1])
     print("daemon:   %s" % ("running (pid %d)" % st["daemon_pid"] if alive else
                             "NOT running (hooks still hold launches; nothing gets paused)"))
     if cfg.get("_error"):
@@ -1097,9 +1234,84 @@ def cmd_config(args):
     return 0
 
 
+def cmd_budget(args):
+    cfg = load_config()
+    m, lvl, st, paused, hold = hook_view(cfg)
+    try:
+        job_mb = parse_size(args.per_job, m["total_kb"]) / 1048576.0 if args.per_job else None
+        need_kb = parse_size(args.need, m["total_kb"]) // 1024 if args.need else None
+    except ValueError as e:
+        print("ram-guard: %s" % e, file=sys.stderr)
+        return 2
+    b = budget(m, cfg, job_mb)
+    procs = scan()
+    agents = owned_trees(procs, cfg, {})[2]
+    per_session_kb = sum(procs[a].rss_kb for a in agents) // len(agents) if agents else 0
+    verdict = None
+    if need_kb is not None:
+        if hold or need_kb > b["launch_room_kb"]:
+            verdict = "no"
+        elif need_kb > b["warn_room_kb"]:
+            verdict = "alone"
+        else:
+            verdict = "yes"
+    if args.json:
+        print(json.dumps({"level": lvl, "hold": bool(hold), "used_pct": m["used_pct"],
+                          "available_mb": m["avail_kb"] // 1024,
+                          "usable_before_warn_mb": b["warn_room_kb"] // 1024,
+                          "usable_before_hold_mb": b["launch_room_kb"] // 1024,
+                          "job_mb": b["job_kb"] // 1024, "parallel_jobs": 0 if hold else b["slots"],
+                          "cpus": b["cpus"], "suggested_cap_mb": b["cap_kb"] // 1024,
+                          "agent_sessions": len(agents), "per_session_mb": per_session_kb // 1024,
+                          "need_fits": verdict}))
+        return 0
+    print("ram-guard budget: " + budget_line(m, cfg, b, hold=hold))
+    if hold:
+        print("Wait with `ram-guard wait`, or free memory: `ram-guard top`, `ram-guard kill <pid>`.")
+    elif agents:
+        print("%s usable before the %g%% warn line. Each extra Claude session costs about %s; "
+              "subagents inside a session cost almost nothing until they start processes." % (
+                  gb(b["warn_room_kb"]), cfg["warn_pct"], mb(per_session_kb)))
+    if verdict == "yes":
+        print("A %s job fits now." % args.need)
+    elif verdict == "alone":
+        print("A %s job fits only by going past the warn line: run it alone and capped, "
+              "`ram-guard run --max %s -- <cmd>`." % (args.need, size_arg(need_kb)))
+    elif verdict == "no":
+        print("A %s job does not fit now. Use `ram-guard wait --need %s`, or shrink the job." % (
+            args.need, args.need))
+    return 0
+
+
+def cmd_wait(args):
+    """Block until launches are allowed again. One call, no tokens spent while waiting."""
+    cfg = load_config()
+    try:
+        need_kb = parse_size(args.need, read_mem()["total_kb"]) // 1024 if args.need else 0
+    except ValueError as e:
+        print("ram-guard: %s" % e, file=sys.stderr)
+        return 2
+    t0 = time.time()
+    while True:
+        cfg = load_config()
+        m, lvl, st, paused, hold = hook_view(cfg)
+        if not hold and budget(m, cfg)["launch_room_kb"] >= need_kb:
+            print("ram-guard: ready after %ds. %s" % (int(time.time() - t0), budget_line(m, cfg)))
+            return 0
+        if time.time() - t0 >= args.timeout:
+            print("ram-guard: not ready after %ds. %s" % (
+                int(time.time() - t0), budget_line(m, cfg, hold=hold)))
+            for line in paused_lines(paused) + tree_lines(cfg, st, 3):
+                print(line)
+            print("Free memory you own with `ram-guard kill <pid>`, or tell the user other "
+                  "applications hold it. For a longer wait pass --timeout and a matching Bash timeout.")
+            return 1
+        time.sleep(2)
+
+
 # ----------------------------------------------------------------- install
 
-HOOK_RE = re.compile(r"ram_guard\.py['\"]? hook")
+HOOK_RE = re.compile(r"ram_guard\.py['\"]? hook|ram_guard_hook\.sh")
 UNIT_NAME = "ram-guard.service"
 
 
@@ -1230,15 +1442,19 @@ def cmd_install(args):
             shutil.copy2(path, backup)
         _strip_hooks(settings)
         command = "%s %s hook" % (shlex.quote(py), shlex.quote(SCRIPT))
+        # Per-call hooks go through a tiny shell fast path that exits in about a
+        # millisecond while memory is plentiful, without starting Python.
+        fast = "sh %s" % shlex.quote(os.path.join(os.path.dirname(SCRIPT), "ram_guard_hook.sh"))
         hooks = settings.setdefault("hooks", {})
         hooks.setdefault("PreToolUse", []).append({
             "matcher": "Bash|Agent|Task|Workflow",
-            "hooks": [{"type": "command", "command": command,
+            "hooks": [{"type": "command", "command": fast,
                        "timeout": int(load_config()["hook_wait_sec"]) + 15,
                        "statusMessage": "ram-guard checking memory"}]})
-        for event in ("UserPromptSubmit", "SessionStart"):
-            hooks.setdefault(event, []).append(
-                {"hooks": [{"type": "command", "command": command, "timeout": 10}]})
+        hooks.setdefault("UserPromptSubmit", []).append(
+            {"hooks": [{"type": "command", "command": fast, "timeout": 10}]})
+        hooks.setdefault("SessionStart", []).append(
+            {"hooks": [{"type": "command", "command": command, "timeout": 10}]})
         os.makedirs(os.path.dirname(path), exist_ok=True)
         atomic_write(path, json.dumps(settings, indent=2) + "\n")
         print("  hooks      added to %s%s" % (path, " (backup: %s)" % backup if backup else ""))
@@ -1284,6 +1500,13 @@ def main(argv=None):
     sub.add_parser("hook", help="Claude Code hook entry point (reads JSON on stdin)")
     p = sub.add_parser("status", help="memory level, paused processes, recent events")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("budget", help="how much work fits in the free memory right now")
+    p.add_argument("--need", help="ask whether a job of this size fits, e.g. 6G")
+    p.add_argument("--per-job", help="size of one heavy job for the parallelism estimate (default: job_mb)")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("wait", help="block until memory has recovered")
+    p.add_argument("--timeout", type=float, default=100, help="seconds (default 100, under the 2 minute Bash limit)")
+    p.add_argument("--need", help="also wait until this much room is free, e.g. 6G")
     p = sub.add_parser("top", help="heaviest agent-started process trees")
     p.add_argument("-n", type=int, default=10)
     p = sub.add_parser("resume", help="resume everything paused and snooze pausing")
@@ -1312,7 +1535,7 @@ def main(argv=None):
             return 0  # a broken guard must never block the agent
     if args.sub == "daemon":
         return Daemon().run()
-    fn = {"status": cmd_status, "top": cmd_top, "resume": cmd_resume, "kill": cmd_kill,
+    fn = {"status": cmd_status, "budget": cmd_budget, "wait": cmd_wait, "top": cmd_top, "resume": cmd_resume, "kill": cmd_kill,
           "run": cmd_run, "config": cmd_config, "install": cmd_install,
           "uninstall": cmd_uninstall}.get(args.sub)
     if fn is None:

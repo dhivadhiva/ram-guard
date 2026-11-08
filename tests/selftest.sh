@@ -7,7 +7,9 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 RG="python3 $HERE/scripts/ram_guard.py"
 T="$(mktemp -d)"
 export RAM_GUARD_CONFIG="$T/config.json" RAM_GUARD_RUNTIME="$T/run" \
-       RAM_GUARD_MEMINFO="$T/meminfo" RAM_GUARD_PSI="/dev/null"
+       RAM_GUARD_MEMINFO="$T/meminfo" RAM_GUARD_PSI="$T/psi"
+: > "$T/psi"
+FAST="sh $HERE/scripts/ram_guard_hook.sh"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
@@ -32,10 +34,14 @@ cleanup(){
 }
 trap cleanup EXIT
 
-cat > "$T/config.json" <<EOF
+cfgwrite(){ # min_run_sec. Thresholds are pinned so the numbers below do not depend on defaults.
+cat > "$T/config.json.new" <<EOF
 {"agent_names": ["rgfakeagent"], "min_tree_mb": 40, "interval_sec": 0.2, "notify": false,
- "hook_wait_sec": 2, "max_pause_sec": 0, "remind_sec": 300, "snooze_sec": 3}
+ "warn_pct": 80, "pause_pct": 90, "resume_pct": 75, "kill_pct": 97, "kill_swap_pct": 90,
+ "hook_wait_sec": 2, "max_pause_sec": 0, "remind_sec": 300, "snooze_sec": 3, "min_run_sec": $1}
 EOF
+mv "$T/config.json.new" "$T/config.json"; }
+cfgwrite 0
 
 # A fake agent with two children: a big one (~200 MB) and a small one (~60 MB).
 # (#!/bin/bash, not env: the kernel names the process after the script only when
@@ -61,6 +67,15 @@ check "status reports OK"            '$RG status | grep -q "level:    OK"'
 check "daemon is running"            '$RG status | grep -q "daemon:   running"'
 check "top lists the fake agent"     '$RG top | grep -q rgfakeagent'
 check "hook is silent when healthy"  '[ -z "$(echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"},\"session_id\":\"s1\"}" | $RG hook)" ]'
+check "daemon publishes the fast-path line"       '[ -s "$T/run/quiet" ]'
+check "fast path is silent and skips Python"      '[ -z "$(echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"},\"session_id\":\"f1\"}" | RAM_GUARD_PYTHON=/nonexistent $FAST)" ]'
+echo "full avg10=60.00 avg60=30.00 avg300=10.00 total=1" > "$T/psi"; sleep 1
+check "pressure alone never slows work while RAM is free" '$RG status | grep -q "level:    OK" && [ "$(pstate $BIG)" != T ] && [ -s "$T/run/quiet" ]'
+: > "$T/psi"
+check "session start states the budget"  'echo "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"s1\"}" | $RG hook | grep -q "Budget: up to 4 heavy jobs in parallel"'
+check "budget command sizes parallelism" '$RG budget | grep -q "up to 4 heavy jobs in parallel"'
+check "budget --need answers yes and no" '$RG budget --need 4G | grep -q "fits now" && $RG budget --need 20G | grep -q "does not fit"'
+check "wait returns at once when healthy" '$RG wait --timeout 5 | grep -q "ready after 0s"'
 
 echo "2. warn (85%)"
 setmem 85 10; sleep 1
@@ -70,6 +85,19 @@ OUT=$(echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"co
 check "hook adds a reminder"         'echo "$OUT" | grep -q additionalContext && ! echo "$OUT" | grep -q permissionDecision'
 OUT=$(echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"make"},"session_id":"s1"}' | $RG hook)
 check "reminder is rate limited"     '[ -z "$OUT" ]'
+check "fast-path line is withdrawn"  '[ ! -e "$T/run/quiet" ]'
+check "fast path hands over to the full hook" 'echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"},\"session_id\":\"f2\"}" | $FAST | grep -q "memory is tight"'
+echo "full avg10=60.00 avg60=30.00 avg300=10.00 total=1" > "$T/psi"
+waitfor "pressure plus high RAM use does pause" 5 '[ "$(pstate $BIG)" = T ]'
+: > "$T/psi"; setmem 50 10
+waitfor "and it resumes when RAM is free again" 8 '[ "$(pstate $BIG)" != T ]'
+setmem 85 10; sleep 1
+
+echo "2b. launch reserve (88%: below the pause line, but no room for new work)"
+setmem 88 10; sleep 1
+check "level is still WARN, nothing paused" '$RG status | grep -q "level:    WARN" && [ "$(pstate $BIG)" != T ]'
+check "a new heavy launch is denied"        'echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"},\"session_id\":\"s2\"}" | $RG hook | grep -q deny'
+check "budget reports none"                 '$RG budget | grep -q "Budget: none"'
 
 echo "3. critical (92%)"
 setmem 92 10
@@ -80,6 +108,11 @@ check "the fake agent itself is never paused"          '[ "$(pstate $APID)" != T
 S=$(date +%s)
 OUT=$(echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"make -j8"},"session_id":"s1"}' | $RG hook)
 check "heavy launch is held, then denied" 'echo "$OUT" | grep -q "\"permissionDecision\": \"deny\"" && [ $(( $(date +%s) - S )) -ge 2 ]'
+N0=$(date +%s%N)
+OUT=$(echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"make -j8"},"session_id":"s1"}' | $RG hook)
+check "a repeat is denied at once, in one line" 'echo "$OUT" | grep -q "still blocked" && [ $(( ($(date +%s%N) - N0) / 1000000 )) -lt 1500 ]'
+check "ram-guard run is not treated as light"   'echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ram-guard run --max 1G -- make\"},\"session_id\":\"s1\"}" | $RG hook | grep -q deny'
+check "wait times out while memory is critical" '! $RG wait --timeout 1 > /dev/null'
 check "inspection command is let through" '[ -z "$(echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ram-guard status\"},\"session_id\":\"s1\"}" | $RG hook)" ]'
 check "chained command is not treated as light" 'echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ps; make\"},\"session_id\":\"s1\"}" | $RG hook | grep -q deny'
 check "prompt hook explains the hold" 'echo "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\"}" | $RG hook | grep -q "on hold"'
@@ -90,6 +123,16 @@ echo "4. recovery (70%)"
 setmem 70 10
 waitfor "smallest tree resumes first" 8 '[ "$(pstate $SMALL)" != T ]'
 waitfor "largest tree resumes"        8 '[ "$(pstate $BIG)" != T ]'
+
+echo "4b. no stop-start churn"
+cfgwrite 60; sleep 1
+setmem 92 10; sleep 2
+check "a job that just resumed is not frozen again straight away" '[ "$(pstate $BIG)" != T ] && [ "$(pstate $SMALL)" != T ]'
+setmem 95 10
+waitfor "unless memory gets dangerously low" 5 '[ "$(pstate $BIG)" = T ]'
+cfgwrite 0; setmem 70 10
+waitfor "then it resumes as usual"       8 '[ "$(pstate $BIG)" != T ]'
+sleep 1
 
 echo "5. manual resume and snooze"
 setmem 92 10
@@ -133,7 +176,7 @@ count(){ python3 -c "
 import json,sys
 s=json.load(open('$H/.claude/settings.json'))
 cmds=[h['command'] for g in sum(s.get('hooks',{}).values(),[]) for h in g['hooks']]
-print(s.get('theme'), sum('ram_guard.py' in c for c in cmds), sum(c=='echo mine' for c in cmds))"; }
+print(s.get('theme'), sum('ram_guard' in c for c in cmds), sum(c=='echo mine' for c in cmds))"; }
 inst install; inst install
 check "hooks added once, existing settings kept" '[ "$(count)" = "dark 3 1" ]'
 check "settings backup written"                  '[ -f "$H/.claude/settings.json.ram-guard.bak" ]'

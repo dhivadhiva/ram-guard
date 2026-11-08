@@ -1,169 +1,178 @@
 ---
 name: ram-guard
-description: Protects the machine and Claude from running out of memory while agents work. A background monitor pauses the heaviest agent-started processes when RAM gets critical, holds new launches until it recovers, and only kills as a last resort. Use this skill whenever a message or tool result starts with "ram-guard:", a Bash, Agent or Workflow call is held or blocked for memory, or the user mentions RAM, memory usage, out-of-memory, OOM kills, swapping, the system freezing or lagging, or Claude crashing during agent runs. Also use it before starting memory-heavy work (parallel agents, large builds, big test suites, dev servers, data or ML jobs) and to install, check, tune or troubleshoot the ram-guard monitor, even if the user does not name it.
+description: Sizes agent work to the memory that is actually free, and protects the machine and Claude from running out of it. Gives a memory budget (how many heavy jobs fit right now), pauses the fastest-growing agent-started job only when RAM is nearly full, and kills only as a last resort. Use this skill whenever a message or tool result starts with "ram-guard:", a Bash, Agent or Workflow call is held or blocked for memory, or the user mentions RAM, memory usage, out-of-memory, OOM kills, swapping, the system freezing or lagging, or Claude crashing or slowing down during agent runs. Also use it before starting memory-heavy or parallel work (several agents, large builds, big test suites, dev servers, data or ML jobs) to check the budget first, and to install, check, tune or troubleshoot the ram-guard monitor, even if the user does not name it.
 ---
 
 # ram-guard
 
-ram-guard keeps a machine usable while AI agents work on it. Agents are good at starting
-many heavy processes at once (parallel builds, test runners, dev servers, more agents), and
-when memory runs out the kernel or systemd-oomd kills whatever is biggest, which is often
-the agent session or the whole desktop app. ram-guard steps in earlier and more gently:
-it pauses work instead of losing it.
+ram-guard lets agents use nearly all of a machine's memory without tipping it over. When
+memory runs out, the kernel or systemd-oomd kills whatever is biggest, often the agent
+session or the whole desktop app, and the conversation is lost with it. ram-guard prevents
+that in two ways: it tells you how much work fits **before** you start it, and it freezes a
+runaway job at the last moment instead of letting the machine die.
 
-It has two parts, both in `scripts/ram_guard.py`:
+It is built to stay out of the way. While memory is plentiful it does nothing, says
+nothing, and its hooks cost about a millisecond per call.
+
+Two parts, both in `scripts/`:
 
 - **A monitor daemon** (systemd user service `ram-guard`) that reads memory every couple of
-  seconds and acts on processes that agents started.
-- **Claude Code hooks** that tell you when memory is tight and hold new launches while it
-  is critical. Their messages always start with `ram-guard:`.
+  seconds and acts only on processes that agents started.
+- **Claude Code hooks** that state the memory budget at session start and hold new launches
+  when there is no room. Their messages always start with `ram-guard:`.
 
 "Agent-started" means any descendant of a `claude` process. Agent sessions themselves, MCP
 servers, the desktop app and everything the user started are never paused or killed.
 
+## Plan from the budget
+
+This is the main habit, because it avoids every other situation below. Starting work that
+does not fit costs far more than checking: the job gets frozen, the call times out, and
+you spend tokens finding out why.
+
+```bash
+ram-guard budget
+```
+
+```
+ram-guard budget: RAM 18% used, 24.8 GB available. Budget: up to 8 heavy jobs in parallel (about 2.0 GB each, limited by CPU count). Cap a big command: `ram-guard run --max 16G -- <cmd>`.
+```
+
+- Before fanning out agents, builds or test runs, read the budget and start no more heavy
+  jobs at once than it allows. If it says one at a time, run them one after another.
+- If you know a job's size, ask directly: `ram-guard budget --need 6G` answers whether it
+  fits now. `--per-job 4G` resizes the parallelism estimate.
+- Subagents inside a session cost almost nothing until they start processes. A separate
+  Claude session costs a few hundred megabytes. The heavy part is what they run.
+- For one big command, cap it: `ram-guard run --max 6G -- <command>`. A capped command
+  that outgrows its cap is killed inside its own cgroup and nothing else is hurt.
+
+The session-start line already carries the budget, so you often do not need to run the
+command at all for the first piece of work.
+
 ## Levels
 
-| Level | Default trigger | What ram-guard does |
+Defaults, as a share of RAM in use. They are deliberately late: on a 32 GB machine agents
+can use about 30 GB before anything is frozen.
+
+| Level | Default | What ram-guard does |
 |---|---|---|
-| ok | below 80% RAM | Nothing. Hooks stay silent. |
-| warn | 80% RAM used | Hooks tell you memory is tight. Nothing is paused. |
-| critical | 90% RAM used, or heavy memory-pressure stalls | Pauses (SIGSTOP) the fastest-growing or largest agent-started process tree. Pauses more only if usage keeps rising. Holds new Bash, Agent and Workflow calls. |
-| emergency | 97% RAM used and 90% of swap used | Kills the single largest agent-started tree, at most one every few seconds, until out of the emergency. |
+| ok | below 87% | Nothing. Hooks exit in about a millisecond. |
+| warn | 87% | One short reminder with the budget, at most every five minutes. |
+| hold | about 1 GB before the pause line | New Bash, Agent and Workflow calls are held, so work is not started only to be frozen. |
+| critical | 93% | Freezes (SIGSTOP) the fastest-growing agent-started process tree. Freezes another only if usage keeps rising. |
+| emergency | 97% and 90% of swap used | Kills the single largest agent-started tree. |
 
-Paused processes resume on their own, smallest first, once usage falls below 75%. If usage
-sits between the pause and resume lines for five minutes, they are released anyway so
-nothing stays frozen forever.
+Frozen jobs thaw by themselves below 88%, smallest first. A job that was just thawed runs
+for at least 30 seconds before it can be frozen again, so work never stutters. Memory
+pressure stalls are also watched, but only count once RAM is above the warn line.
 
-## How to respond
+When other applications need memory, this is how agents make room: the frozen job stops
+touching its memory, so the kernel swaps it out and gives the RAM to whoever needs it.
 
-### "memory is getting tight" (warn)
+## When ram-guard speaks
 
-Nothing is blocked yet. The goal is to avoid reaching 90%, because from there your own
-processes get frozen mid-run. Before starting more work:
+### "memory is tight"
 
-1. Run `ram-guard top` to see what your work is using.
-2. Stop what is no longer needed: finished dev servers, watchers, stale test runners
-   (`ram-guard kill <pid>`).
-3. Run the remaining work with less parallelism: one agent or build at a time, `-j2`
-   instead of `-j$(nproc)`, fewer test workers, smaller batch sizes.
-4. Wrap anything heavy as `ram-guard run --max 4G -- <command>`. A capped command that
-   outgrows its cap is slowed and then killed inside its own cgroup; nothing else is hurt.
+Nothing is blocked. Follow the budget in the message: run heavy jobs one after another,
+stop dev servers and watchers you no longer need (`ram-guard top`, `ram-guard kill <pid>`),
+and cap what remains.
 
-### A tool call was held, then went through
+### A call was held, then went through
 
-Memory was critical when you made the call and recovered while the hook waited. Carry on,
-but treat it as a warn: the machine is close to the edge.
+A short spike cleared while the hook waited. Carry on with low parallelism.
 
-### A tool call was blocked (critical)
+### A call was blocked
 
-The call was held for about 45 seconds and denied because memory did not recover. The
-command was not wrong, and retrying it immediately will only be held again.
+The call was fine; there was no room for it. Retrying in a loop wastes tokens and time.
 
-1. Look first. `ram-guard status`, `ram-guard top`, `ps`, `free` and `kill` are always
-   allowed, and so are file reads and edits.
-2. If trees you started are large and you no longer need them, free them with
-   `ram-guard kill <pid>`.
-3. If nothing of yours is large, other applications hold the memory. Say so to the user
-   plainly, with the numbers from `ram-guard status`, and wait. Do not try to work around
-   the hold.
-4. When memory recovers, restart the work in a lighter form (see the warn list).
+1. Run `ram-guard wait` once. It blocks until memory has recovered and costs no tokens
+   while it waits. It gives up after 100 seconds; for longer, pass `--timeout` with a
+   matching Bash timeout.
+2. If it reports ready, retry the call once, sized to the new budget.
+3. If it does not, look: `ram-guard top`. Free jobs of yours that you no longer need with
+   `ram-guard kill <pid>`. If nothing of yours is large, other applications hold the
+   memory: tell the user so with the numbers, and stop.
+
+Inspection commands (`ram-guard status|top|budget|wait|kill`, `ps`, `free`) and file
+reads and edits are never blocked.
 
 ### Some of your processes are paused
 
-A paused command is frozen, not failed: it continues where it stopped once memory
-recovers. Two things follow from that:
-
-- A foreground Bash call whose process is paused can hit the Bash tool timeout. If that
-  happens, check `ram-guard status` before assuming the command hung or rerunning it.
-- If you need the memory back rather than the work, `ram-guard kill <pid>` ends a paused
-  tree cleanly.
+A paused command is frozen, not failed, and continues where it stopped. A foreground Bash
+call whose process is frozen can hit the Bash timeout, so check `ram-guard status` before
+assuming a hang or rerunning. If you want the memory back rather than the work, end it
+with `ram-guard kill <pid>`.
 
 `ram-guard resume` thaws everything and turns pausing off for two minutes. It overrides a
-safety decision, so use it when the user asks for it, not to get your own work unstuck.
+safety decision, so use it when the user asks for it, not to unstick your own work.
 
-### Something was killed (emergency)
+### Something was killed
 
 `ram-guard status` shows a `KILLED` line with the command. Tell the user what was lost,
-then rerun it capped (`ram-guard run --max ...`) or with less parallelism. Rerunning it
-unchanged will most likely end the same way.
-
-## Before memory-heavy work
-
-When the task clearly needs a lot of memory, check first rather than finding out at 90%:
-
-```bash
-ram-guard status
-```
-
-Then size the work to what is available: cap the heavy command with `ram-guard run`, and
-prefer running agents or builds one after another over launching them together.
+then rerun it capped or with less parallelism. Unchanged, it will end the same way.
 
 ## Commands
 
 ```bash
-ram-guard status            # level, memory, paused processes, recent events (--json for scripts)
-ram-guard top               # agent sessions and the process trees they started, largest first
-ram-guard kill <pid>        # end one agent-started tree (TERM, then KILL); `largest` also works
+ram-guard budget            # how much work fits now; --need 6G, --per-job 4G, --json
+ram-guard wait              # block until launches are allowed again; --timeout, --need
+ram-guard status            # level, memory, paused processes, recent events; --json
+ram-guard top               # agent sessions and the process trees they started
+ram-guard kill <pid>        # end one agent-started tree; `largest` also works
 ram-guard run --max 4G -- <command>   # run under a memory cap; --swap sets the swap cap
 ram-guard resume            # thaw everything and snooze pausing for two minutes
-ram-guard config            # show settings; `ram-guard config pause_pct 85` changes one
+ram-guard config            # show settings; `ram-guard config pause_pct 90` changes one
 ```
 
-`ram-guard kill` refuses agent sessions and anything no agent started, so it cannot be
-pointed at the user's own programs by mistake.
+`ram-guard kill` refuses agent sessions and anything no agent started.
 
 ## Installing, checking and removing
-
-Install (idempotent, safe to rerun after an update):
 
 ```bash
 python3 ~/.claude/skills/ram-guard/scripts/ram_guard.py install
 ```
 
-This writes default settings to `~/.config/ram-guard/config.json`, links the `ram-guard`
-command into `~/.local/bin`, enables the `ram-guard` systemd user service, and merges three
-hooks into `~/.claude/settings.json` (a backup is kept next to it). Sessions that were
-already open may need a restart to load the hooks.
-
-Check that it is healthy:
+Idempotent, so rerun it after an update. It writes `~/.config/ram-guard/config.json`,
+links the `ram-guard` command into `~/.local/bin`, enables the systemd user service, and
+merges three hooks into `~/.claude/settings.json` with a backup beside it.
 
 ```bash
 ram-guard status
-systemctl --user status ram-guard
 journalctl --user -u ram-guard -n 50
-```
-
-Run the self-test, which fakes memory readings and never touches real sessions:
-
-```bash
 bash ~/.claude/skills/ram-guard/tests/selftest.sh
 ```
 
-Remove it with `ram-guard uninstall`.
+The self-test fakes memory readings and never touches real sessions. Remove everything
+with `ram-guard uninstall`.
 
 ## Settings
 
-Edit `~/.config/ram-guard/config.json` or use `ram-guard config <key> <value>`; the daemon
-reloads within seconds.
+`ram-guard config <key> <value>`; the daemon reloads within seconds.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `warn_pct` / `pause_pct` / `resume_pct` | 80 / 90 / 75 | RAM-in-use thresholds |
-| `kill_enabled`, `kill_pct`, `kill_swap_pct` | true, 97, 90 | Last-resort kill. Set `kill_enabled` to false for pause-only |
-| `psi_warn` / `psi_pause` | 10 / 25 | Memory-pressure stall thresholds (0 turns them off) |
+| `warn_pct` / `pause_pct` / `resume_pct` | 87 / 93 / 88 | RAM-in-use thresholds |
+| `launch_reserve_mb` | 1024 | Hold new launches this far before the pause line |
+| `job_mb` | 2048 | Assumed size of one heavy job, for the budget |
+| `min_run_sec` | 30 | Guaranteed run time after a thaw |
+| `kill_enabled`, `kill_pct`, `kill_swap_pct` | true, 97, 90 | Last-resort kill; `kill_enabled false` means pause only |
+| `psi_warn` / `psi_pause` | 10 / 25 | Pressure-stall thresholds, 0 turns them off |
 | `min_tree_mb` | 100 | Trees smaller than this are never paused |
-| `max_pause_sec` | 300 | Stale-pause release (0 turns it off) |
+| `max_pause_sec` | 300 | Release a pause after this long if RAM is under `pause_pct` |
 | `hook_wait_sec` | 45 | How long a launch is held before it is denied |
 | `agent_names` | `["claude"]` | Process names treated as agents |
-| `protect_names`, `protect_cmdline` | see `ram-guard config` | Processes never paused or killed |
+| `protect_names`, `protect_cmdline` | see `ram-guard config` | Never paused or killed |
 | `hooks_enabled`, `notify` | true | Turn the hooks or desktop notifications off |
+
+On a small machine (8 GB or less) the defaults leave little slack; lower `pause_pct`.
 
 ## Limits worth knowing
 
 - Linux only (it reads `/proc` and uses cgroup v2 for `run`).
-- Pausing stops a process from growing; it does not shrink it. Memory comes back when
-  paused work is swapped out, finishes, or is killed.
-- If the memory is held by programs no agent started, ram-guard can only hold agent work
-  and notify the user. It will not touch those programs.
-- A GUI program an agent launched (an editor, a browser) counts as agent-started. Add its
-  process name to `protect_names` if it should never be paused.
+- Pausing stops a process from growing; memory comes back when the frozen work is
+  swapped out, finishes, or is killed.
+- If programs no agent started hold the memory, ram-guard can only hold agent work and
+  notify the user.
+- A GUI program an agent launched counts as agent-started. Add its process name to
+  `protect_names` if it should never be paused.
