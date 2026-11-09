@@ -88,7 +88,12 @@ The call was fine; there was no room for it. Retrying in a loop wastes tokens an
 
 1. Run `ram-guard wait` once. It blocks until memory has recovered and costs no tokens
    while it waits. It gives up after 100 seconds; for longer, pass `--timeout` with a
-   matching Bash timeout.
+   matching Bash timeout. It prints one of:
+
+   ```
+   ram-guard: ready after 42s. RAM 71% used, 8.8 GB available. Budget: up to 2 heavy jobs in parallel ...
+   ram-guard: not ready after 100s. RAM 92% used, 2.4 GB available. Budget: none; ...
+   ```
 2. If it reports ready, retry the call once, sized to the new budget.
 3. If it does not, look: `ram-guard top`. Free jobs of yours that you no longer need with
    `ram-guard kill <pid>`. If nothing of yours is large, other applications hold the
@@ -125,7 +130,10 @@ ram-guard resume            # thaw everything and snooze pausing for two minutes
 ram-guard config            # show settings; `ram-guard config pause_pct 90` changes one
 ```
 
-`ram-guard kill` refuses agent sessions and anything no agent started.
+`budget`, `wait`, `status` and `top` only read. They never start, stop or change
+anything, so run them freely without checking first. `ram-guard kill` refuses agent
+sessions and anything no agent started, and it ends the whole process tree, which a plain
+`kill` on one pid does not: frozen children would be left behind still holding memory.
 
 ## Installing, checking and removing
 
