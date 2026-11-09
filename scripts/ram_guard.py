@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 HOME = os.path.expanduser("~")
 UID = os.getuid()
 MYPID = os.getpid()
@@ -87,7 +87,12 @@ DEFAULTS = {
     "hook_wait_sec": 45,     # how long a tool call is held before it is denied
     "remind_sec": 300,       # min gap between "memory is tight" reminders per session
     "hooks_enabled": True,
-    "notify": True,          # desktop notifications via notify-send
+    # Desktop notifications (notify-send) are kept rare on purpose: nothing for a brief
+    # pause or a resume, one quiet notice if work stays frozen for notify_after_sec, and
+    # an urgent one only when something is killed. At most one quiet notice per notify_gap_sec.
+    "notify": True,
+    "notify_after_sec": 60,
+    "notify_gap_sec": 600,
     "oom_score_adj": 500,    # make agent-started processes the kernel's preferred OOM victims; 0 disables
     "agent_names": ["claude"],
     "protect_names": ["ram-guard", "systemd", "dbus-daemon", "dbus-broker", "sshd",
@@ -523,6 +528,8 @@ class Daemon(object):
         self.kids = []
         self.resumed_at = {}        # root pid -> (starttime, when thawed)
         self.quiet_written = None
+        self.last_quiet_note = 0.0
+        self.episode_notified = False
         self.last_notify = {}
         self.last_err = ("", 0.0)
 
@@ -538,16 +545,22 @@ class Daemon(object):
         self.events.append(line)
         print(line, flush=True)
 
-    def notify(self, title, body, urgency="normal"):
+    def notify(self, title, body, urgent=False):
         if not self.cfg["notify"] or not shutil.which("notify-send"):
             return
         now = time.time()
-        if now - self.last_notify.get(title, 0) < 60:
-            return
-        self.last_notify[title] = now
+        if urgent:
+            if now - self.last_notify.get(title, 0) < 60:
+                return
+            self.last_notify[title] = now
+        else:
+            if now - self.last_quiet_note < self.cfg["notify_gap_sec"]:
+                return
+            self.last_quiet_note = now
         try:
             self.kids.append(subprocess.Popen(
-                ["notify-send", "-a", "ram-guard", "-u", urgency, title, body],
+                ["notify-send", "-a", "ram-guard"] +
+                (["-u", "critical"] if urgent else ["-u", "normal", "-t", "8000"]) + [title, body],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         except OSError:
             pass  # fork can fail when memory is exhausted; never let that stop the guard
@@ -671,6 +684,16 @@ class Daemon(object):
             self.pause_next(m, raw, now)
         elif self.paused:
             self.maybe_resume(m, raw, now)
+        if not self.paused:
+            self.episode_notified = False
+        elif (not self.episode_notified
+              and now - min(e["since"] for e in self.paused) >= cfg["notify_after_sec"]):
+            # A short pause is not worth an interruption; one that drags on is.
+            self.episode_notified = True
+            self.notify("Agent work is paused: memory is nearly full",
+                        "%s. %d job(s) frozen for over %d seconds; they resume by themselves "
+                        "below %g%%. `ram-guard status` shows details." % (
+                            describe(m), len(self.paused), cfg["notify_after_sec"], cfg["resume_pct"]))
         self.write_state(m, now)
         self.write_quiet(m)
         return raw
@@ -749,10 +772,9 @@ class Daemon(object):
                 self.noted_nothing = True
                 self.log("memory is %s but no agent-started process over %d MB is running; "
                          "other applications hold the memory" % (raw, cfg["min_tree_mb"]))
-                self.notify("Memory is critically low",
-                            "%s. Nothing started by an agent is large enough to pause. "
-                            "New agent work is on hold; close other applications." % describe(m),
-                            "critical")
+                self.notify("Memory is nearly full",
+                            "%s. Other applications hold it, so new agent work is on hold "
+                            "until some is freed." % describe(m))
             return
         mem_crit = m["used_pct"] >= cfg["pause_pct"]
         psi_crit = psi_pause_on(m, cfg)
@@ -781,11 +803,6 @@ class Daemon(object):
         self.last_stop_t, self.last_stop_used = now, m["used_pct"]
         self.log("PAUSED pid %d %s (%s, %d processes): %s" % (
             t["root"], t["comm"], mb(t["rss_kb"]), len(pids), describe(m)))
-        self.notify("Paused agent work to protect memory",
-                    "%s\nPaused: %s (pid %d, %s). It resumes below %g%%.\n"
-                    "`ram-guard status` shows details." % (
-                        describe(m), t["comm"], t["root"], mb(t["rss_kb"]), cfg["resume_pct"]),
-                    "critical")
 
     def maybe_resume(self, m, raw, now):
         cfg = self.cfg
@@ -814,8 +831,6 @@ class Daemon(object):
         self.resumed_at[e["root"]] = (root_start, time.time())
         self.log("RESUMED pid %d %s (%s)%s" % (e["root"], e["comm"], why,
                                                ": " + describe(m) if m else ""))
-        if not self.paused:
-            self.notify("Agent work resumed", "All paused processes are running again.")
 
     def resume_all(self, why):
         for e in list(self.paused):
@@ -850,7 +865,7 @@ class Daemon(object):
             best["root"], best["comm"], mb(best_kb), n, describe(m), cmd))
         self.notify("Killed an agent process to save the system",
                     "%s\nKilled: %s (pid %d, %s)\n%s" % (
-                        describe(m), best["comm"], best["root"], mb(best_kb), cmd), "critical")
+                        describe(m), best["comm"], best["root"], mb(best_kb), cmd), urgent=True)
 
     def write_state(self, m, now, stopped=False):
         st = {

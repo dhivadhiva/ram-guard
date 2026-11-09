@@ -36,7 +36,8 @@ trap cleanup EXIT
 
 cfgwrite(){ # min_run_sec. Thresholds are pinned so the numbers below do not depend on defaults.
 cat > "$T/config.json.new" <<EOF
-{"agent_names": ["rgfakeagent"], "min_tree_mb": 40, "interval_sec": 0.2, "notify": false,
+{"agent_names": ["rgfakeagent"], "min_tree_mb": 40, "interval_sec": 0.2,
+ "notify": true, "notify_after_sec": 3, "notify_gap_sec": 600,
  "warn_pct": 80, "pause_pct": 90, "resume_pct": 75, "kill_pct": 97, "kill_swap_pct": 90,
  "hook_wait_sec": 2, "max_pause_sec": 0, "remind_sec": 300, "snooze_sec": 3, "min_run_sec": $1}
 EOF
@@ -59,7 +60,16 @@ setmem 50 10
 "$T/rgfakeagent" "$T" & APID=$!
 sleep 1.5
 BIG=$(cat "$T/big.pid"); SMALL=$(cat "$T/small.pid")
-$RG daemon > "$T/daemon.log" 2>&1 & DPID=$!
+# A stand-in notify-send that only records what it was asked to show.
+mkdir -p "$T/bin"
+cat > "$T/bin/notify-send" <<'NOTIFY_EOF'
+#!/bin/sh
+# one line per notification, whatever the body contains
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$RG_NOTES"
+NOTIFY_EOF
+chmod +x "$T/bin/notify-send"
+: > "$T/notes.log"
+RG_NOTES="$T/notes.log" PATH="$T/bin:$PATH" $RG daemon > "$T/daemon.log" 2>&1 & DPID=$!
 sleep 1
 
 echo "1. healthy"
@@ -102,6 +112,7 @@ check "budget reports none"                 '$RG budget | grep -q "Budget: none"
 echo "3. critical (92%)"
 setmem 92 10
 waitfor "largest tree is paused"     5 '[ "$(pstate $BIG)" = T ]'
+check "a brief pause shows no notification" '[ ! -s "$T/notes.log" ]'
 sleep 1
 check "smaller tree keeps running while usage is flat" '[ "$(pstate $SMALL)" != T ]'
 check "the fake agent itself is never paused"          '[ "$(pstate $APID)" != T ]'
@@ -116,6 +127,7 @@ check "wait times out while memory is critical" '! $RG wait --timeout 1 > /dev/n
 check "inspection command is let through" '[ -z "$(echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ram-guard status\"},\"session_id\":\"s1\"}" | $RG hook)" ]'
 check "chained command is not treated as light" 'echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ps; make\"},\"session_id\":\"s1\"}" | $RG hook | grep -q deny'
 check "prompt hook explains the hold" 'echo "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\"}" | $RG hook | grep -q "on hold"'
+check "one quiet notice once the pause drags on" '[ "$(wc -l < "$T/notes.log")" -eq 1 ] && grep -q "normal" "$T/notes.log"'
 setmem 93 10
 waitfor "next tree is paused once usage rises" 5 '[ "$(pstate $SMALL)" = T ]'
 
@@ -146,6 +158,7 @@ echo "6. last resort (98% RAM, swap 95%)"
 setmem 98 95
 waitfor "largest tree is killed"      6 '[ "$(pstate $BIG)" = gone ] || [ "$(pstate $BIG)" = Z ]'
 check "the fake agent survives"       'kill -0 $APID 2>/dev/null'
+check "a kill is announced urgently; nothing else was shown" '[ "$(wc -l < "$T/notes.log")" -eq 2 ] && tail -1 "$T/notes.log" | grep -q "critical.*Killed"'
 setmem 50 10; sleep 1.5
 
 echo "7. daemon exit resumes everything"
@@ -157,6 +170,7 @@ waitfor "new tree is paused"          5 '[ "$(pstate $BIG2)" = T ]'
 check "a process no agent started is left alone" '[ "$(pstate $STRAY)" != T ]'
 kill -TERM "$DPID"; wait "$DPID" 2>/dev/null; DPID=
 check "processes run again after the daemon stops" '[ "$(pstate $BIG2)" != T ]'
+check "the whole run showed only two notifications" '[ "$(wc -l < "$T/notes.log")" -eq 2 ]'
 pkill -KILL -P "$APID2" 2>/dev/null; kill -KILL "$APID2" "$STRAY" 2>/dev/null
 
 echo "8. ram-guard kill"
@@ -194,7 +208,7 @@ else
 fi
 
 echo
-echo "daemon log:"; sed 's/^/  /' "$T/daemon.log"
+echo "notifications shown:"; sed "s/^/  /" "$T/notes.log"; echo; echo "daemon log:"; sed 's/^/  /' "$T/daemon.log"
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

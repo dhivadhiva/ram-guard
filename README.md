@@ -47,6 +47,8 @@ What keeps it from slowing Claude down:
   so a container thrashing against its own limit does not freeze anything.
 - **No stop-start churn.** A job that was just thawed runs for at least 30 seconds before
   it can be frozen again.
+- **No notification spam.** A brief pause and a resume show nothing. You get one quiet
+  notice if work stays frozen for a minute, and an urgent one only if something is killed.
 - **No retry loops.** A blocked call is answered with one instruction: run
   `ram-guard wait`, which blocks until memory recovers and costs no tokens.
 
@@ -126,7 +128,8 @@ On a machine with 8 GB or less the defaults leave little slack, so lower `pause_
 | `protect_names` | system services, tmux, screen | Process names that are never paused or killed |
 | `protect_cmdline` | MCP servers | Command-line patterns that are never paused or killed |
 | `oom_score_adj` | 500 | Kernel OOM preference given to agent-started processes, 0 turns it off |
-| `hooks_enabled` / `notify` | true | Turn the hooks or desktop notifications off |
+| `notify`, `notify_after_sec`, `notify_gap_sec` | true, 60, 600 | Desktop notices: none for a brief pause, one if work stays frozen this long, at most one per gap. Kills are always announced |
+| `hooks_enabled` | true | Turn the hooks off |
 
 ## How it works
 

@@ -163,7 +163,8 @@ with `ram-guard uninstall`.
 | `hook_wait_sec` | 45 | How long a launch is held before it is denied |
 | `agent_names` | `["claude"]` | Process names treated as agents |
 | `protect_names`, `protect_cmdline` | see `ram-guard config` | Never paused or killed |
-| `hooks_enabled`, `notify` | true | Turn the hooks or desktop notifications off |
+| `notify`, `notify_after_sec`, `notify_gap_sec` | true, 60, 600 | Desktop notices: none for a brief pause, one if work stays frozen this long, at most one per gap. Kills are always announced |
+| `hooks_enabled` | true | Turn the hooks off |
 
 On a small machine (8 GB or less) the defaults leave little slack; lower `pause_pct`.
 

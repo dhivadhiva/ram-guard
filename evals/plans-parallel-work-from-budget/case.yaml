@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: plans-parallel-work-from-budget
+expected_outcome: |
+  Before committing to running everything at once, the response measures free memory on this machine (the ram-guard budget, or an equivalent reading), sizes the parallelism to that figure, and puts a memory cap on the heavy commands so one of them cannot take the machine down.

@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: paused-command-is-not-rerun
+expected_outcome: |
+  The response does not simply rerun the tests. It explains that the test process is frozen rather than failed and will continue by itself when memory recovers, checks ram-guard status first, and offers the two real options: wait for the automatic resume, or kill that process tree with ram-guard kill to get the memory back and rerun later in a lighter form.
